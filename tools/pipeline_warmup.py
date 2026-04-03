@@ -81,14 +81,15 @@ def warmup_manifest(corpus_dir: str, manifest_path: str, msg: str):
     
     for root, _, files in os.walk(corpus_dir):
         for file in files:
-            # Skip non-excel files and temporary system files
             if file.endswith(".xlsx") and not file.startswith("~$"):
                 file_path = os.path.join(root, file)
                 content_hash = get_semantic_hash(file_path)
+                file_key = file # 使用文件名作为追踪主键
                 
-                # Register only if the hash is not already tracked
-                if content_hash not in processed_state:
-                    processed_state[content_hash] = {
+                # 检查文件名是否已记录，且 hash 未发生变化
+                if file_key not in processed_state or processed_state[file_key].get("hash") != content_hash:
+                    processed_state[file_key] = {
+                        "hash": content_hash,
                         "file_path": os.path.abspath(file_path),
                         "task_msg": msg,
                         "processed_time": "WARMUP_INITIALIZED_" + datetime.now().strftime("%Y%m%d_%H%M%S")

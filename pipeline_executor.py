@@ -180,9 +180,14 @@ class DeltaTracker:
             json.dump(self.history, f, indent=4, ensure_ascii=False)
             
     def update_history(self, file_path: str, new_hash: str):
-        """直接更新指定文件的哈希记录。"""
+        """直接更新指定文件的哈希记录，保持与 warmup 一致的字典结构。"""
+        from datetime import datetime
         file_key = os.path.basename(file_path)
-        self.history[file_key] = new_hash
+        
+        self.history[file_key] = {
+            "hash": new_hash,
+            "processed_time": datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
 
 
 # =============================================================================
@@ -582,15 +587,19 @@ def execute_testset_phase(tasks: list, global_cfg: dict):
         # ---------------------------------------------------------
         # [阶段 2A]: 前端高并发 - 语义哈希计算与文本提取
         # ---------------------------------------------------------
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting PARALLEL Hash & Text Extraction...")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] starting parallel hash & text extraction...")
         frontend_results = []
         
-        # 开启进程池，最大化利用 CPU 核心
         with ProcessPoolExecutor(max_workers=4) as executor:
             futures = []
             for file_path in excel_files:
                 file_key = os.path.basename(file_path)
-                history_hash = tracker.history.get(file_key)
+                
+                # 修改此处：适配嵌套字典的数据结构
+                history_record = tracker.history.get(file_key, {})
+                # 兼容老数据(直接存string)和新数据(存dict)
+                history_hash = history_record.get("hash") if isinstance(history_record, dict) else history_record
+                
                 log_file = os.path.join(log_dir, f"testset_{os.path.splitext(file_key)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
                 
                 futures.append(executor.submit(
