@@ -19,7 +19,7 @@ import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
-
+import fcntl
 import pandas as pd
 import yaml
 
@@ -226,10 +226,9 @@ def step1_extract_oov(base_cmd: list, task_out_path: str, msg: str,
 
 def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str,
                       log_file: str) -> bool:
-    """Phase 1 Step 2: G2P 发音预测。"""
+    """Phase 1 Step 2: G2P 发音预测 (进程排他锁模式，对抗底层硬编码冲突)。"""
 
     lang_abbr_map = global_cfg.get('lang_abbr_map', {})
-    
     task_out_path_temp = task_out_path + "_temp"
     oov_file_path = os.path.join(
         task_out_path_temp, "custom_corpus_process", "dict_dir", "aaa_oov_base_dict"
@@ -239,43 +238,74 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
         return True
 
     lang_id = str(task.get('l', ''))
-    # 动态获取缩写
-    lang_abbr = lang_abbr_map.get(lang_id) or task.get('language', msg)
-
+    lang_abbr = lang_abbr_map.get(lang_id) or str(task.get('language', msg))
 
     g2p_root = global_cfg.get('g2p_root_dir')
-    g2p_lang_dir = os.path.join(g2p_root, str(lang_abbr), "g2p_models")
-    g2p_input_txt = os.path.join(g2p_lang_dir, "input.txt")
+    g2p_lang_dir = Path(g2p_root) / str(lang_abbr) / "g2p_models"
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {g2p_input_txt}")
-
-    if not os.path.isdir(g2p_lang_dir):
-        warning_msg = f"\n[WARNING] G2P directory not found: {g2p_lang_dir}. Skipping G2P.\n"
-        try:
-            with open(log_file, 'a', encoding='utf-16le') as f:
-                f.write(warning_msg)
-        except Exception:
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(warning_msg)
+    if not g2p_lang_dir.is_dir():
+        warning_msg = f"\n[WARNING] G2P directory not found: {g2p_lang_dir}. Skipping.\n"
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(warning_msg)
         return True
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Phase1_Step2 (G2P Predict OOV) for {msg}")
+    # 底层脚本共享的固定输入输出路径
+    g2p_input_txt = g2p_lang_dir / "input.txt"
+    g2p_output_dict_shared = g2p_lang_dir / "output.dict"
+    
+    # 我们自己的私有提取路径，防止产物被后续任务冲刷掉
+    private_output_dict = Path(task_out_path_temp) / f"g2p_output_{msg}.dict"
 
+    # 嗅探编码 (智能兼容 UTF-16 和 UTF-8)
+    target_encoding = 'utf-8'
+    target_newline = '\n'
+    if g2p_input_txt.exists():
+        with open(g2p_input_txt, 'rb') as f_probe:
+            raw_bytes = f_probe.read(2)
+            if raw_bytes in (b'\xff\xfe', b'\xfe\xff'):
+                target_encoding = 'utf-16'
+                target_newline = '\r\n'
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] WAITING LOCK: Phase1_Step2 for {msg}")
+
+    # ==========================================
+    # 临界区：进程排他锁 (防 frontinfo.txt 冲突)
+    # ==========================================
+    lock_file_path = g2p_lang_dir / ".g2p_engine_exec.lock"
+    
     try:
-        # 读取 UTF-8 源文件
-        with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
-            content = f_in.read()
-        # 写入 UCS-2 LE BOM (Windows CRLF)
-        with open(g2p_input_txt, 'w', encoding='utf-16', newline='\r\n') as f_out:
-            f_out.write(content)
+        with open(lock_file_path, 'w') as lock_file:
+            # 申请排他锁，拿不到锁的并发任务会在这里乖乖排队，不消耗 CPU
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: Executing G2P for {msg}")
+                
+                # 1. 写入 OOV 文本
+                with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
+                    content = f_in.read()
+                with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
+                    f_out.write(content)
+                    
+                # 2. 执行危险的底层黑盒脚本
+                g2p_script_cmd = ["bash", "run.sh"]
+                success = run_subprocess(g2p_script_cmd, str(g2p_lang_dir), log_file)
+                
+                # 3. 火速将战利品私有化，防止被下一秒进来的任务覆盖
+                if success and g2p_output_dict_shared.exists():
+                    shutil.copy2(g2p_output_dict_shared, private_output_dict)
+                else:
+                    return False
+            finally:
+                # 无论发生什么天崩地裂的错误，绝对保证锁被释放，拯救系统
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] RELEASED LOCK: G2P finished for {msg}")
+                
     except Exception as e:
-        shutil.copy2(oov_file_path, g2p_input_txt)
         with open(log_file, 'a', encoding='utf-8') as f_log:
-            f_log.write(f"[ERROR] Transcoding to UCS-2 LE BOM failed: {str(e)}\n")
+            f_log.write(f"[ERROR] Locked G2P execution failed: {str(e)}\n")
+        return False
 
-    g2p_script_cmd = ["bash", "run.sh"]
-    return run_subprocess(g2p_script_cmd, g2p_lang_dir, log_file)
-
+    return True
 
 def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> bool:
     """Phase 1 Step 3: 合并预测发音到主词典。"""
