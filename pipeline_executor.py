@@ -9,7 +9,7 @@ ASR 自动化流水线执行器，支持以下功能：
 Usage:
     python pipeline_executor.py -g config/global_config.yaml -j config/job.yaml
 """
-
+import uuid
 import argparse
 import hashlib
 import json
@@ -495,23 +495,20 @@ def execute_phase1(tasks: list, global_cfg: dict):
 # =============================================================================
 # Phase 2: 测试集生成
 # =============================================================================
-def phase2_frontend_worker(file_path: str, history_hash: str, task: dict, global_cfg: dict, log_file: str):
+def phase2_frontend_worker(file_path: str, history_hash: str, task: dict, global_cfg: dict, log_file: str, temp_dir: str):
     """
     前端并行任务：计算哈希并抽取文本。
-    返回: (文件路径, 是否发生修改, 新哈希值, 生成的txt路径, 抽取是否成功)
     """
-    # 1. 并发计算最新哈希
     current_hash = DeltaTracker.get_semantic_hash(file_path)
     if current_hash == history_hash:
         return file_path, False, current_hash, None, True
 
-    # 2. 哈希变更，执行并发抽取
     python_exec = global_cfg.get('python_exec')
     adapter_script = global_cfg.get('adapter_script')
-    output_base_dir = global_cfg.get('output_dir')
     
     hash_val = hashlib.md5(file_path.encode('utf-8')).hexdigest()[:8]
-    txt_temp_path = os.path.join(output_base_dir, "test_sets", "temp", f"{hash_val}.txt")
+    # 使用传入的独立沙箱目录进行无锁写入
+    txt_temp_path = os.path.join(temp_dir, f"{hash_val}.txt")
     
     adapter_cmd = [
         python_exec, adapter_script,
@@ -559,89 +556,87 @@ def phase2_backend_serial(file_path: str, txt_temp_path: str, task: dict, global
     return success
 
 def execute_testset_phase(tasks: list, global_cfg: dict):
-    """执行 Phase 2 测试集生成 (架构：前端高并发抽取 -> 后端严格串行 TTS)。"""
-    print("\n=== Pipeline Phase 2: Parallel Extraction + Serial TTS ===")
+    """执行 phase 2 测试集生成 (架构：前端高并发抽取 -> 后端严格串行 tts)。"""
+    print("\n=== pipeline phase 2: parallel extraction + serial tts ===")
 
     output_base_dir = global_cfg.get('output_dir')
     asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir')
 
-    for task in tasks:
-        if not task.get('enable_testset'):
-            continue
+    # 为当前流水线任务创建完全隔离的专属 temp 目录
+    run_uuid = uuid.uuid4().hex[:8]
+    run_temp_dir = os.path.join(output_base_dir, "test_sets", f"temp_{run_uuid}")
+    os.makedirs(run_temp_dir, exist_ok=True)
 
-        msg = str(task.get('msg'))
-        lang_id = str(task.get('l', 0))
-        lang_map = global_cfg.get('parsed_language_map', {})
-        lang_name = lang_map.get(lang_id, f"lang_{lang_id}")
-        corpus_dir = os.path.join(asrmlg_exp_dir, task.get('excel_corpus_path', ''))
-
-        if not os.path.exists(corpus_dir):
-            continue
-
-        manifest_path = os.path.join(output_base_dir, "test_sets", f"{lang_name}_{msg}_testset_manifest.json")
-        tracker = DeltaTracker(manifest_path)
-        log_dir = os.path.join(output_base_dir, "logs", lang_name, msg)
-
-        excel_files = [os.path.join(corpus_dir, f) for f in os.listdir(corpus_dir) if f.endswith('.xlsx') and not f.startswith('~')]
-
-        # ---------------------------------------------------------
-        # [阶段 2A]: 前端高并发 - 语义哈希计算与文本提取
-        # ---------------------------------------------------------
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] starting parallel hash & text extraction...")
-        frontend_results = []
-        
-        with ProcessPoolExecutor(max_workers=4) as executor:
-            futures = []
-            for file_path in excel_files:
-                file_key = os.path.basename(file_path)
-                
-                # 修改此处：适配嵌套字典的数据结构
-                history_record = tracker.history.get(file_key, {})
-                # 兼容老数据(直接存string)和新数据(存dict)
-                history_hash = history_record.get("hash") if isinstance(history_record, dict) else history_record
-                
-                log_file = os.path.join(log_dir, f"testset_{os.path.splitext(file_key)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
-                
-                futures.append(executor.submit(
-                    phase2_frontend_worker, file_path, history_hash, task, global_cfg, log_file
-                ))
-            
-            # 等待所有前端并发任务完成
-            for future in as_completed(futures):
-                frontend_results.append(future.result())
-
-        # ---------------------------------------------------------
-        # [阶段 2B]: 后端严格串行 - TTS 生成与文件打包
-        # ---------------------------------------------------------
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting SERIAL TTS Generation & Packaging...")
-        
-        for file_path, is_modified, current_hash, txt_temp_path, ext_success in frontend_results:
-            excel_basename = os.path.basename(file_path)
-            
-            if not is_modified:
-                print(f"[Skip] No changes: {excel_basename}")
-                continue
-                
-            if not ext_success:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] FAILED: {excel_basename} (Text Extraction Failed)")
+    try:
+        for task in tasks:
+            if not task.get('enable_testset'):
                 continue
 
-            # 开始串行调用脆弱的 TTS 引擎
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] PROCESSING TTS: {excel_basename}...")
-            log_file = os.path.join(log_dir, f"testset_{os.path.splitext(excel_basename)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
+            msg = str(task.get('msg'))
+            lang_id = str(task.get('l', 0))
+            lang_map = global_cfg.get('parsed_language_map', {})
+            lang_name = lang_map.get(lang_id, f"lang_{lang_id}")
+            corpus_dir = os.path.join(asrmlg_exp_dir, task.get('excel_corpus_path', ''))
+
+            if not os.path.exists(corpus_dir):
+                continue
+
+            manifest_path = os.path.join(output_base_dir, "test_sets", f"{lang_name}_{msg}_testset_manifest.json")
+            tracker = DeltaTracker(manifest_path)
+            log_dir = os.path.join(output_base_dir, "logs", lang_name, msg)
+
+            excel_files = [os.path.join(corpus_dir, f) for f in os.listdir(corpus_dir) if f.endswith('.xlsx') and not f.startswith('~')]
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] starting parallel hash & text extraction...")
+            frontend_results = []
             
-            tts_success = phase2_backend_serial(file_path, txt_temp_path, task, global_cfg, lang_name, log_file)
+            with ProcessPoolExecutor(max_workers=4) as executor:
+                futures = []
+                for file_path in excel_files:
+                    file_key = os.path.basename(file_path)
+                    history_hash = tracker.history.get(file_key)
+                    log_file = os.path.join(log_dir, f"testset_{os.path.splitext(file_key)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
+                    
+                    # 挂载专属的 run_temp_dir 到 worker
+                    futures.append(executor.submit(
+                        phase2_frontend_worker, file_path, history_hash, task, global_cfg, log_file, run_temp_dir
+                    ))
+                
+                for future in as_completed(futures):
+                    frontend_results.append(future.result())
 
-            if tts_success:
-                # 引擎合成成功后，更新该文件在内存中的哈希记录
-                tracker.update_history(file_path, current_hash)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: {excel_basename}")
-            else:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] FAILED: {excel_basename} (TTS Generation Failed)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] starting serial tts generation & packaging...")
+            
+            for file_path, is_modified, current_hash, txt_temp_path, ext_success in frontend_results:
+                excel_basename = os.path.basename(file_path)
+                
+                if not is_modified:
+                    print(f"[skip] no changes: {excel_basename}")
+                    continue
+                    
+                if not ext_success:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] failed: {excel_basename} (text extraction failed)")
+                    continue
 
-        # 循环外层：所有文件处理完毕，统一执行一次落盘操作
-        tracker.save()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] TASK COMPLETED: Manifest saved to {manifest_path}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] processing tts: {excel_basename}...")
+                log_file = os.path.join(log_dir, f"testset_{os.path.splitext(excel_basename)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
+                
+                tts_success = phase2_backend_serial(file_path, txt_temp_path, task, global_cfg, lang_name, log_file)
+
+                if tts_success:
+                    tracker.update_history(file_path, current_hash)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] success: {excel_basename}")
+                else:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] failed: {excel_basename} (tts generation failed)")
+
+            tracker.save()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] task completed: manifest saved to {manifest_path}")
+            
+    finally:
+        # 兜底操作：强制抹除本周期的专属资源栈，保证环境清洁且互不干扰
+        if os.path.exists(run_temp_dir):
+            shutil.rmtree(run_temp_dir, ignore_errors=True)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] cleanup: removed isolated temporary directory {run_temp_dir}")
 
 # =============================================================================
 # Phase 3: 模型评估
