@@ -1,47 +1,46 @@
 """
-asr pipeline executor
+ASR Pipeline Executor
 
-asr automated pipeline executor, supporting:
-- phase 1: resource build & g2p
-- phase 2: incremental testset generation
-- phase 3: baseline evaluation
+ASR 自动化流水线执行器，支持以下功能：
+- Phase 1: 资源打包与 G2P (发音预测)
+- Phase 2: 增量测试集生成
+- Phase 3: 模型评估 (TODO)
+
+Usage:
+    python pipeline_executor.py -g config/global_config.yaml -j config/job.yaml
 """
-
+import uuid
 import argparse
-import configparser
-import fcntl
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-
+import fcntl
 import pandas as pd
 import yaml
+import configparser
+import os
 
 # =============================================================================
-# utility functions
+# 工具函数 (Utility Functions)
 # =============================================================================
-
 def get_file_md5_suffix(file_path: str, suffix_len: int = 4) -> str:
-    """calculate md5 of a file and return the last n characters."""
+    """计算文件的 md5 值，并返回后指定位数的字符串。"""
     hash_md5 = hashlib.md5()
     with open(file_path, "rb") as f:
+        # 每次读取 4MB 块，防止大文件 OOM
         for chunk in iter(lambda: f.read(4096 * 1024), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()[-suffix_len:]
 
-
 def load_language_map(file_path: str) -> dict:
-    """load language mapping configuration."""
+    """加载语言映射文件。"""
     if not os.path.exists(file_path):
-        print(f"[error] language map file not found at {file_path}", file=sys.stderr)
+        print(f"Error: Language map file not found at {file_path}", file=sys.stderr)
         sys.exit(1)
 
     lang_map = {}
@@ -55,10 +54,13 @@ def load_language_map(file_path: str) -> dict:
     return lang_map
 
 
-def run_subprocess(cmd: List[str], cwd: str, log_file: str, env: Optional[Dict[str, str]] = None) -> bool:
-    """execute subprocess, capture logs, and optionally inject environment variables."""
+# =============================================================================
+# 工具函数更新：支持环境变量注入
+# =============================================================================
+def run_subprocess(cmd: list, cwd: str, log_file: str, env: dict = None) -> bool:
+    """执行子进程命令并记录日志，支持覆盖环境变量 (如 ld_library_path)"""
     try:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
         with open(log_file, 'a') as f:
             f.write(f"\n[{datetime.now().strftime('%H:%M:%S')}] CMD: {' '.join(cmd)}\n")
             f.flush()
@@ -67,12 +69,12 @@ def run_subprocess(cmd: List[str], cwd: str, log_file: str, env: Optional[Dict[s
             return process.returncode == 0
     except Exception as e:
         with open(log_file, 'a') as f:
-            f.write(f"\n[fatal error] {str(e)}\n")
+            f.write(f"\n[FATAL ERROR] {str(e)}\n")
         return False
 
 
 def resolve_and_bind_paths(global_cfg: dict, base_path: str) -> dict:
-    """resolve relative paths in configuration to absolute paths."""
+    """解析并绑定配置中的相对路径为绝对路径。"""
     py_exec = global_cfg.get('python_exec')
     if not py_exec:
         global_cfg['python_exec'] = sys.executable
@@ -91,12 +93,23 @@ def resolve_and_bind_paths(global_cfg: dict, base_path: str) -> dict:
     return global_cfg
 
 
+def safe_copy_oov_content(src_path: str, dst_path: str, log_file: str) -> bool:
+    """安全拷贝 OOV 文件到 G2P 输入端（严格保留原始二进制编码与换行符）。"""
+    try:
+        shutil.copy2(src_path, dst_path)
+        return True
+    except Exception as e:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n[ERROR] Failed to copy OOV content from {src_path} to {dst_path}: {str(e)}\n")
+        return False
+
+
 # =============================================================================
-# delta tracker logic
+# 增量追踪器 (Delta Tracker)
 # =============================================================================
 
 class DeltaTracker:
-    """semantic hash-based delta tracker for incremental processing."""
+    """基于语义哈希的增量追踪器，用于避免重复处理未变更的文件。"""
 
     def __init__(self, manifest_path: str):
         self.manifest_path = manifest_path
@@ -110,8 +123,16 @@ class DeltaTracker:
     
     @staticmethod
     def get_semantic_hash(file_path: str) -> str:
-        """calculate semantic hash of the excel corpus."""
+        """
+        静态方法：计算文件的语义哈希值。
+        
+        支持业务模板与普通语料降级：
+        - 识别 'sent'/'shuofa' 列或 '<>' 标签页
+        - 降级处理：无特殊页时读取第一列或 'text' 列
+        - 失败时回退到 MD5 文件哈希
+        """
         try:
+            # 引入在进程池中可能需要的局部依赖，确保进程安全
             import pandas as pd
             import hashlib
             
@@ -122,6 +143,7 @@ class DeltaTracker:
             for sheet in xl.sheet_names:
                 sheet_lower = sheet.lower()
                 
+                # 提取固定句子或说法模板
                 if 'sent' in sheet_lower or 'shuofa' in sheet_lower:
                     has_special_sheet = True
                     df = pd.read_excel(xl, sheet_name=sheet, header=None)
@@ -131,6 +153,7 @@ class DeltaTracker:
                         if pd.notna(x) and str(x).strip()
                     ])
                     
+                # 提取槽位字典
                 elif '<>' in sheet:
                     has_special_sheet = True
                     df = pd.read_excel(xl, sheet_name=sheet)
@@ -140,6 +163,7 @@ class DeltaTracker:
                             vals = df[col].dropna().astype(str).str.strip().tolist()
                             content_list.extend([col_name] + vals)
 
+            # 降级：如果没有找到特殊模板页，则作为普通语料处理
             if not has_special_sheet:
                 df = pd.read_excel(xl, sheet_name=0)
                 if 'text' in df.columns:
@@ -149,25 +173,30 @@ class DeltaTracker:
                 content_list.extend(vals)
 
             if not content_list:
-                raise ValueError("no valid text content found.")
+                raise ValueError("No valid text content found.")
 
+            # 将提取出的所有有效文本拼接，计算哈希
             content_str = "|".join(content_list)
             return hashlib.md5(content_str.encode('utf-8')).hexdigest()
 
-        except Exception:
+        except Exception as e:
             import hashlib
+            # 终极降级：如果 Excel 解析失败或文件格式异常，直接计算文件的物理 MD5
+            # print(f"[Warning] Semantic hash failed for {os.path.basename(file_path)}: {str(e)}") # 可选：打印警告日志
             with open(file_path, "rb") as f:
                 return hashlib.md5(f.read()).hexdigest()
 
     def save(self):
-        """persist state to json manifest."""
-        Path(self.manifest_path).parent.mkdir(parents=True, exist_ok=True)
+        """批量落盘：将内存中的更新一次性写入 JSON。"""
+        os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
         with open(self.manifest_path, 'w', encoding='utf-8') as f:
             json.dump(self.history, f, indent=4, ensure_ascii=False)
             
     def update_history(self, file_path: str, new_hash: str):
-        """update hash record for a specific file."""
+        """直接更新指定文件的哈希记录，保持与 warmup 一致的字典结构。"""
+        from datetime import datetime
         file_key = os.path.basename(file_path)
+        
         self.history[file_key] = {
             "hash": new_hash,
             "processed_time": datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -175,20 +204,23 @@ class DeltaTracker:
 
 
 # =============================================================================
-# phase 1: resource build & g2p
+# Phase 1: 资源打包与 G2P
 # =============================================================================
 
-def build_base_command(task: dict, python_exec: str, train_script: str, asrmlg_exp_dir: str) -> List[str]:
-    """build base command with dynamic parameter pass-through."""
+def build_base_command(task: dict, python_exec: str, train_script: str,
+                       asrmlg_exp_dir: str) -> list:
+    """build base command with exception handling for short options."""
     base_cmd = [
         python_exec if train_script.endswith('.py') else "bash",
         train_script
     ]
 
+    # 定义主工程中强制使用单短横线的特殊短参数白名单
     single_dash_whitelist = {'l', 'G', 'cp', 'np'}
+
     internal_keys = {
         'enable_g2p', 'enable_merge_dict', 'enable_testset', 'enable_eval',
-        'input_wav', 'output', 'only_corpus_process', 'enable_whisper_package', 'whisper_config'
+        'input_wav', 'output', 'only_corpus_process'
     }
 
     path_keys = {
@@ -221,38 +253,49 @@ def build_base_command(task: dict, python_exec: str, train_script: str, asrmlg_e
     return base_cmd
 
 
-def step1_extract_oov(base_cmd: List[str], task_out_path: str, msg: str,
+def step1_extract_oov(base_cmd: list, task_out_path: str, msg: str,
                       asrmlg_exp_dir: str, log_file: str) -> bool:
-    """extract oov words."""
+    """Phase 1 Step 1: 提取 OOV 词汇。"""
     task_out_path_temp = task_out_path + "_temp"
     cmd = base_cmd + ["--only_corpus_process", "--output", task_out_path_temp]
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: phase1_step1 (extract oov) for {msg}")
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Phase1_Step1 (Extract OOV) for {msg}")
     return run_subprocess(cmd, asrmlg_exp_dir, log_file)
 
 
-def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str, log_file: str) -> bool:
-    """execute g2p prediction with exclusive process lock."""
+def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str,
+                      log_file: str) -> bool:
+    """Phase 1 Step 2: G2P 发音预测 (进程排他锁模式，对抗底层硬编码冲突)。"""
+
     lang_abbr_map = global_cfg.get('lang_abbr_map', {})
     task_out_path_temp = task_out_path + "_temp"
-    oov_file_path = Path(task_out_path_temp) / "custom_corpus_process" / "dict_dir" / "aaa_oov_base_dict"
+    oov_file_path = os.path.join(
+        task_out_path_temp, "custom_corpus_process", "dict_dir", "aaa_oov_base_dict"
+    )
 
-    if not oov_file_path.exists() or oov_file_path.stat().st_size == 0:
+    if not os.path.exists(oov_file_path) or os.path.getsize(oov_file_path) == 0:
         return True
 
     lang_id = str(task.get('l', ''))
     lang_abbr = lang_abbr_map.get(lang_id) or str(task.get('language', msg))
 
-    g2p_lang_dir = Path(global_cfg.get('g2p_root_dir', '')) / str(lang_abbr) / "g2p_models"
+    g2p_root = global_cfg.get('g2p_root_dir')
+    g2p_lang_dir = Path(g2p_root) / str(lang_abbr) / "g2p_models"
 
     if not g2p_lang_dir.is_dir():
+        warning_msg = f"\n[WARNING] G2P directory not found: {g2p_lang_dir}. Skipping.\n"
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[warning] g2p directory not found: {g2p_lang_dir}. skipping.\n")
+            f.write(warning_msg)
         return True
 
+    # 底层脚本共享的固定输入输出路径
     g2p_input_txt = g2p_lang_dir / "input.txt"
     g2p_output_dict_shared = g2p_lang_dir / "output.dict"
+    
+    # 我们自己的私有提取路径，防止产物被后续任务冲刷掉
     private_output_dict = Path(task_out_path_temp) / f"g2p_output_{msg}.dict"
 
+    # 嗅探编码 (智能兼容 UTF-16 和 UTF-8)
     target_encoding = 'utf-8'
     target_newline = '\n'
     if g2p_input_txt.exists():
@@ -262,75 +305,96 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
                 target_encoding = 'utf-16'
                 target_newline = '\r\n'
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] WAITING LOCK: phase1_step2 for {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] WAITING LOCK: Phase1_Step2 for {msg}")
+
+    # ==========================================
+    # 临界区：进程排他锁 (防 frontinfo.txt 冲突)
+    # ==========================================
     lock_file_path = g2p_lang_dir / ".g2p_engine_exec.lock"
     
     try:
         with open(lock_file_path, 'w') as lock_file:
+            # 申请排他锁，拿不到锁的并发任务会在这里乖乖排队，不消耗 CPU
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: executing g2p for {msg}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: Executing G2P for {msg}")
+                
+                # 1. 写入 OOV 文本
                 with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
                     content = f_in.read()
                 with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
                     f_out.write(content)
                     
-                success = run_subprocess(["bash", "run.sh"], str(g2p_lang_dir), log_file)
+                # 2. 执行危险的底层黑盒脚本
+                g2p_script_cmd = ["bash", "run.sh"]
+                success = run_subprocess(g2p_script_cmd, str(g2p_lang_dir), log_file)
                 
+                # 3. 火速将战利品私有化，防止被下一秒进来的任务覆盖
                 if success and g2p_output_dict_shared.exists():
                     shutil.copy2(g2p_output_dict_shared, private_output_dict)
                 else:
                     return False
             finally:
+                # 无论发生什么天崩地裂的错误，绝对保证锁被释放，拯救系统
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] RELEASED LOCK: g2p finished for {msg}")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] RELEASED LOCK: G2P finished for {msg}")
                 
     except Exception as e:
         with open(log_file, 'a', encoding='utf-8') as f_log:
-            f_log.write(f"[error] locked g2p execution failed: {str(e)}\n")
+            f_log.write(f"[ERROR] Locked G2P execution failed: {str(e)}\n")
         return False
 
     return True
 
-
 def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> bool:
-    """merge predicted phonemes into primary lexicon."""
+    """Phase 1 Step 3: 合并预测发音到主词典。"""
+    # 动态获取资源目录映射
     res_dir_map = global_cfg.get('res_dir_map', {})
     lang_abbr_map = global_cfg.get('lang_abbr_map', {})
+
     merge_script = global_cfg.get('merge_dict_script')
-    res_base_dir = os.path.join(global_cfg.get('asrmlg_exp_dir'), global_cfg.get('res_dir_name', 'res'))
+    res_base_dir = os.path.join(global_cfg.get('asrmlg_exp_dir'), global_cfg.get('res_dir_name'))
 
     if not (merge_script and os.path.exists(merge_script) and res_base_dir):
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[warning] merge dependencies missing. skipping merge.\n")
+            f.write(f"\n[WARNING] merge_dict_script or res_root_dir missing. Skipping Merge.\n")
         return True
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: phase1_step3 (merge oov dict) for {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Phase1_Step3 (Merge OOV Dict) for {msg}")
 
     python_exec = global_cfg.get('python_exec', 'python')
     vcs_script_path = os.path.join(global_cfg.get('tools_dir', './'), 'lexicon_vcs.py')
 
     lang_id = str(task.get('l', 0))
     lang_abbr = lang_abbr_map.get(lang_id)
+
     is_yun_val = str(task.get('is_yun', '0'))
+    # 动态解析资源子目录
     res_dir_name = res_dir_map.get(is_yun_val, "unknown")
+
     lang_map = global_cfg.get('parsed_language_map', {})
     lang_name = lang_map.get(lang_id, "")
 
     target_res_dir = os.path.join(res_base_dir, f"{lang_name}_res", res_dir_name)
     target_dict_path = os.path.join(target_res_dir, "new_dict")
     phone_syms_path = os.path.join(target_res_dir, "phones.syms")
-    g2p_output_dict = os.path.join(global_cfg.get('g2p_root_dir', ''), lang_abbr, "g2p_models", "output.dict")
+    g2p_output_dict = os.path.join(
+        global_cfg.get('g2p_root_dir', ''), lang_abbr, "g2p_models", "output.dict"
+    )
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] merging {target_dict_path}")
 
     if not os.path.exists(g2p_output_dict):
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[error] g2p_output_dict missing at {g2p_output_dict}. aborting merge.\n")
+            f.write(f"\n[ERROR] g2p_output_dict missing at {g2p_output_dict}. Aborting Merge.\n")
         return False
 
+    # Pre-merge
     if os.path.exists(vcs_script_path):
         run_subprocess([python_exec, vcs_script_path, "-i", target_dict_path, "pre_merge"],
                        global_cfg.get('asrmlg_exp_dir'), log_file)
 
+    # 合并
     merge_cmd = [
         python_exec, merge_script,
         "-i", g2p_output_dict,
@@ -342,6 +406,7 @@ def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> b
 
     merge_success = run_subprocess(merge_cmd, global_cfg.get('asrmlg_exp_dir'), log_file)
 
+    # Post-merge
     if merge_success and os.path.exists(vcs_script_path):
         run_subprocess([
             python_exec, vcs_script_path,
@@ -355,17 +420,19 @@ def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> b
     return True
 
 
-def step4_full_build(base_cmd: List[str], task_out_path: str, msg: str,
+def step4_full_build(base_cmd: list, task_out_path: str, msg: str,
                      patch_type: str, asrmlg_exp_dir: str, log_file: str) -> bool:
-    """compile wfst and package standard asr model."""
+    """Phase 1 Step 4: 全量资源打包。"""
+    # 清理临时目录
     task_out_path_temp = task_out_path + "_temp"
     print(f"[{datetime.now().strftime('%H:%M:%S')}] CLEANING: temp dir")
     try:
-        shutil.rmtree(task_out_path_temp, ignore_errors=True)
+        shutil.rmtree(task_out_path_temp)
+        print(f"Successfully deleted: {task_out_path_temp}")
     except OSError as e:
-        pass
+        print(f"Error: {task_out_path_temp} : {e.strerror}")
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: phase1_step4 (full resource build) for {msg}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Phase1_Step4 (Full Resource Build) for {msg}")
 
     base_cmd = base_cmd + ["--output", task_out_path]
     try:
@@ -376,19 +443,101 @@ def step4_full_build(base_cmd: List[str], task_out_path: str, msg: str,
 
     return run_subprocess(base_cmd, asrmlg_exp_dir, log_file)
 
-
 def check_whisper_dependencies(source_dir: str) -> bool:
-    """validate if wfst artifacts are ready for whisper serialization."""
+    """validate if the core artifacts for whisper packaging are ready.
+    generatedg.done acts as the strict sentinel flag for g.fst completion.
+    """
     required_artifacts = [
-        os.path.join(source_dir, "custom_G_pak", "GeneratedG.DONE"),
-        os.path.join(source_dir, "custom_G_pak", "G"),
-        os.path.join(source_dir, "custom_corpus_process", "dict_dir", "aaa_dict_for_use")
+        os.path.join(source_dir, "custom_G_pak", "GeneratedG.DONE"),       # 标记
+        os.path.join(source_dir, "custom_G_pak", "G"),                     # G 网络
+        os.path.join(source_dir, "custom_corpus_process", "dict_dir", "aaa_dict_for_use") # 最终词典
     ]
     return all(os.path.exists(f) for f in required_artifacts)
 
+def run_phase1_pipeline(task: dict, global_cfg: dict, asrmlg_exp_dir: str,
+                        python_exec: str, train_script: str, log_file: str) -> bool:
+    """phase 1 pipeline with artifact-driven state transition."""
+    
+    msg = str(task.get('msg'))
+    lang_id = str(task.get('l', ''))
+    base_out_dir = global_cfg.get('output_dir')
+    resolved_msg = str(task.get('msg', '')).strip()
+    scheme_map = global_cfg.get('scheme_map', {})
+
+    lang_map = global_cfg.get('parsed_language_map', {})
+    lang_name = lang_map.get(lang_id, f"lang_{lang_id}")
+    model_type = scheme_map.get(str(task.get('is_yun', 0)), 'unknown')
+    
+    whisper_cfg = task.get('whisper_config', {})
+    explicit_source_dir = whisper_cfg.get('source_patch_dir')
+
+    # 1. 确定最终产物挂载路径
+    target_dir = explicit_source_dir if explicit_source_dir else os.path.join(
+        base_out_dir, lang_name, resolved_msg,
+        f"{model_type}_{datetime.now().strftime('%Y%m%d')}"
+    )
+
+    # 2. 核心依赖探测 
+    # 只要满足这三个产物存在，直接阻断 1-4 步，进入短路旁路 (short-circuit)
+    if check_whisper_dependencies(target_dir):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] FAST-FORWARD: generatedg.done and artifacts found. skipping to whisper package.")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n[INFO] whisper dependencies met in {target_dir}. bypassing phase 1 steps 1-4.\n")
+            
+        if task.get('enable_whisper_package'):
+            return step5_whisper_package(task, global_cfg, target_dir, log_file)
+        return True
+
+    # 3. 如果是用户强制挂载了某目录，但里头根本没有 generatedg.done，必须抛错阻断
+    if explicit_source_dir:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] FATAL: explicit source_patch_dir missing required artifacts.")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n[ERROR] explicit source_patch_dir {explicit_source_dir} is invalid or incomplete.\n")
+        return False
+
+    # 4. 未触发断点续传，退回正常的主工程全量打包流水线
+    base_cmd = build_base_command(task, python_exec, train_script, asrmlg_exp_dir)
+
+    if not step1_extract_oov(base_cmd, target_dir, msg, asrmlg_exp_dir, log_file):
+        return False
+
+    if task.get('enable_g2p'):
+        if not step2_g2p_predict(task, global_cfg, msg, target_dir, log_file):
+            return False
+
+    if task.get('enable_merge_dict'):
+        step3_merge_dict(task, global_cfg, msg, log_file)
+
+    is_yun_val = str(task.get('is_yun', '0'))
+    patch_type = scheme_map.get(is_yun_val, "unknown")
+    if not step4_full_build(base_cmd, target_dir, msg, patch_type, asrmlg_exp_dir, log_file):
+        return False
+
+    # 5.  step 5 转whisper
+    if task.get('enable_whisper_package'):
+        return step5_whisper_package(task, global_cfg, target_dir, log_file)
+
+    return True
+
+
+# =============================================================================
+# phase 1 step 5: whisper 序列化与标准产物归档
+# =============================================================================
+import os
+import shutil
+import glob
+import uuid
+import subprocess
+from datetime import datetime
+import os
+import shutil
+import uuid
+import configparser
+import subprocess
+from datetime import datetime
 
 def generate_custom_cfg(template_path: str, output_cfg_path: str, work_dir: str, bin_output_name: str, patch_scale: str):
-    """inject absolute paths and exact output names into wfst_serialize config."""
+    """解析并修改 wfst_serialize 配置文件"""
     config = configparser.ConfigParser(allow_no_value=True)
     config.optionxform = str
     config.read(template_path, encoding='utf-8')
@@ -412,13 +561,14 @@ def generate_custom_cfg(template_path: str, output_cfg_path: str, work_dir: str,
 
     return output_cfg_path
 
-
 def step5_whisper_package(task: dict, global_cfg: dict, hybridcnn_gpatch: str, log_file: str) -> bool:
-    """execute zero-copy concurrency pipeline for whisper wfst serialization."""
+    """phase 1 step 5: zero-copy concurrency using exact config routing."""
+    
     if str(task.get('is_yun', '')) != '3':
         return True
 
     whisper_cfg = task.get('whisper_config', {})
+    
     msg = str(task.get('msg', 'music'))
     lang_id = str(task.get('l', ''))
     lang_map = global_cfg.get('parsed_language_map', {})
@@ -437,7 +587,7 @@ def step5_whisper_package(task: dict, global_cfg: dict, hybridcnn_gpatch: str, l
 
     if not all([train_dict, phoneset_path, package_ed_target]):
         with open(log_file, 'a', encoding='utf-8') as f:
-            f.write("\n[error] missing required whisper config\n")
+            f.write("\n[ERROR] missing required whisper config\n")
         return False
 
     if not os.path.isabs(phoneset_path):
@@ -467,7 +617,7 @@ def step5_whisper_package(task: dict, global_cfg: dict, hybridcnn_gpatch: str, l
             shutil.copy2(src, dst)
         else:
             with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n[error] missing required file: {src}\n")
+                f.write(f"\n[ERROR] missing required file: {src}\n")
             return False
 
     replace_dict_cmd = ["bash", "run_replace_dict.sh", train_dict, work_dir, lang_id]
@@ -477,19 +627,26 @@ def step5_whisper_package(task: dict, global_cfg: dict, hybridcnn_gpatch: str, l
     package_ed_cmd = ["./package_ed", dict_remake_path, phoneset_path, package_ed_target, work_dir]
     if not run_subprocess(package_ed_cmd, whisper_tools_dir, log_file): return False
 
+    # =========================================================
+    # 3. 零拷贝并发：共享工作区 + 动态路由配置
+    # =========================================================
     wearlized_dir = os.path.join(whisper_tools_dir, "wearlized")
     wearlized_output_dir = os.path.join(wearlized_dir, "output")
     os.makedirs(wearlized_output_dir, exist_ok=True)
 
     task_uuid = uuid.uuid4().hex[:8]
+
+    # a. 直接在共享的 wearlized 目录下生成带有 uuid 标记的 cfg 文件
     template_cfg = os.path.join(wearlized_dir, "wfst_serialize_large.241227_patch.cfg")
     custom_cfg_name = f"task_{task_uuid}.cfg"
     custom_cfg_path = os.path.join(wearlized_dir, custom_cfg_name)
     
+    # 强制 c++ 引擎将产物写为 uuid 独占文件名
     exact_bin_name = f"whisper_{patch_type}_{patch_scale}_{patch_name}_{task_uuid}.bin"
     generate_custom_cfg(template_cfg, custom_cfg_path, work_dir, exact_bin_name, patch_scale)
 
     try:
+        # b. 在共享目录下执行 c++ 引擎，挂载专属 cfg
         run_env = os.environ.copy()
         run_env['LD_LIBRARY_PATH'] = f"./:{run_env.get('LD_LIBRARY_PATH', '')}"
         
@@ -497,100 +654,63 @@ def step5_whisper_package(task: dict, global_cfg: dict, hybridcnn_gpatch: str, l
         if not run_subprocess(serialize_cmd, wearlized_dir, log_file, env=run_env): 
             return False
 
+        # c. 直接抓取确定性路径，杜绝交叉污染
         target_bin_file = os.path.join(wearlized_output_dir, exact_bin_name)
         
         if not os.path.exists(target_bin_file):
             with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n[error] serialized bin file not found at expected path: {target_bin_file}\n")
+                f.write(f"\n[ERROR] serialized bin file not found at expected path: {target_bin_file}\n")
             return False
 
+        # =========================================================
+        # d. 原生 python md5 计算与安全归档 (替代 filename_add_md5sum.py)
+        # =========================================================
         try:
+            # 1. 计算文件 md5 的后 4 位
             md5_tail = get_file_md5_suffix(target_bin_file, 4)
+            
+            # 2. 组装新文件名: base_name + _md5后四位 + .bin
             base_name, ext = os.path.splitext(exact_bin_name)
             final_bin_name = f"{base_name}_{md5_tail}{ext}"
+            
+            # 3. 确定最终的绝对落地路径
             final_dest_path = os.path.join(final_whisper_out, final_bin_name)
             
+            # 4. 执行文件拷贝
             shutil.copy2(target_bin_file, final_dest_path)
+            
             with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n[info] natively copied bin to {final_dest_path} (md5 tail: {md5_tail})\n")
+                f.write(f"\n[INFO] Natively copied bin to {final_dest_path} (MD5 tail: {md5_tail})\n")
                 
         except Exception as e:
             with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n[error] failed during native md5 calculation or copying: {str(e)}\n")
+                f.write(f"\n[ERROR] Failed during native MD5 calculation or copying: {str(e)}\n")
             return False
 
     finally:
+        # e. 精确销毁：只删除当前 uuid 所持有的专属配置与 bin 文件
         if os.path.exists(custom_cfg_path):
             os.remove(custom_cfg_path)
         if 'target_bin_file' in locals() and os.path.exists(target_bin_file):
             os.remove(target_bin_file)
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: whisper artifacts exported to {final_whisper_out}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] SUCCESS: Whisper artifacts exported to {final_whisper_out}")
     return True
 
-
-def run_phase1_pipeline(task: dict, global_cfg: dict, asrmlg_exp_dir: str,
-                        python_exec: str, train_script: str, log_file: str) -> bool:
-    """phase 1 pipeline state machine with bypass routing."""
-    msg = str(task.get('msg'))
-    lang_id = str(task.get('l', ''))
-    base_out_dir = global_cfg.get('output_dir')
-    resolved_msg = str(task.get('msg', '')).strip()
-    scheme_map = global_cfg.get('scheme_map', {})
-
-    lang_map = global_cfg.get('parsed_language_map', {})
-    lang_name = lang_map.get(lang_id, f"lang_{lang_id}")
-    model_type = scheme_map.get(str(task.get('is_yun', 0)), 'unknown')
-    
-    whisper_cfg = task.get('whisper_config', {})
-    explicit_source_dir = whisper_cfg.get('source_patch_dir')
-
-    target_dir = explicit_source_dir if explicit_source_dir else os.path.join(
-        base_out_dir, lang_name, resolved_msg,
-        f"{model_type}_{datetime.now().strftime('%Y%m%d')}"
-    )
-
-    if check_whisper_dependencies(target_dir):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] FAST-FORWARD: generatedg.done and artifacts found. skipping to whisper package.")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[info] whisper dependencies met in {target_dir}. bypassing phase 1 steps 1-4.\n")
-            
-        if task.get('enable_whisper_package'):
-            return step5_whisper_package(task, global_cfg, target_dir, log_file)
-        return True
-
-    if explicit_source_dir:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] FATAL: explicit source_patch_dir missing required artifacts.")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[error] explicit source_patch_dir {explicit_source_dir} is invalid or incomplete.\n")
-        return False
-
-    base_cmd = build_base_command(task, python_exec, train_script, asrmlg_exp_dir)
-
-    if not step1_extract_oov(base_cmd, target_dir, msg, asrmlg_exp_dir, log_file):
-        return False
-
-    if task.get('enable_g2p'):
-        if not step2_g2p_predict(task, global_cfg, msg, target_dir, log_file):
-            return False
-
-    if task.get('enable_merge_dict'):
-        step3_merge_dict(task, global_cfg, msg, log_file)
-
-    is_yun_val = str(task.get('is_yun', '0'))
-    patch_type = scheme_map.get(is_yun_val, "unknown")
-    if not step4_full_build(base_cmd, target_dir, msg, patch_type, asrmlg_exp_dir, log_file):
-        return False
-
-    if task.get('enable_whisper_package'):
-        return step5_whisper_package(task, global_cfg, target_dir, log_file)
-
-    return True
+def is_step4_completed(task_out_path: str) -> bool:
+    """检查第四步全量资源打包是否已完成（基于核心产物是否存在）"""
+    required_files = [
+        os.path.join(task_out_path, "custom_G_pak", "G"),
+        os.path.join(task_out_path, "custom_G_pak", "GeneratedG.DONE"),
+        os.path.join(task_out_path, "custom_corpus_process", "dict_dir", "aaa_dict_for_use")
+    ]
+    return all(os.path.exists(f) for f in required_files)
 
 
-def execute_phase1(tasks: List[dict], global_cfg: dict):
-    """dispatch phase 1 tasks to process pool."""
-    print("\n=== pipeline phase 1: resource build & g2p (parallel mode) ===")
+
+def execute_phase1(tasks: list, global_cfg: dict):
+    """执行 Phase 1 调度 (内部自动进行多进程并发)。"""
+    print("\n=== Pipeline Phase 1: Resource Build & G2P (Parallel Mode) ===")
 
     python_exec = global_cfg.get('python_exec')
     asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir')
@@ -599,6 +719,7 @@ def execute_phase1(tasks: List[dict], global_cfg: dict):
     )
 
     futures = {}
+    # 把进程池的创建移到函数内部
     with ProcessPoolExecutor(max_workers=4) as executor:
         for task in tasks:
             if not any([
@@ -613,7 +734,7 @@ def execute_phase1(tasks: List[dict], global_cfg: dict):
             lang_name = lang_map.get(lang_id, f"lang_{lang_id}")
             msg = str(task.get('msg'))
 
-            log_dir = os.path.join(global_cfg.get('output_dir', ''), "logs", lang_name, msg)
+            log_dir = os.path.join(global_cfg.get('output_dir'), "logs", lang_name, msg)
             os.makedirs(log_dir, exist_ok=True)
             log_file = os.path.join(log_dir, f"phase1_build_{datetime.now().strftime('%Y%m%d')}.log")
 
@@ -624,42 +745,52 @@ def execute_phase1(tasks: List[dict], global_cfg: dict):
 
         for msg, future in futures.items():
             status = "SUCCESS" if future.result() else "FAILED"
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}: phase1_{msg}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}: Phase1_{msg}")
 
 
 # =============================================================================
-# phase 2: incremental testset generation
+# Phase 2: 测试集生成
 # =============================================================================
-
-def phase2_frontend_worker(file_path: str, history_hash: Any, task: dict, global_cfg: dict, log_file: str, temp_dir: str) -> Tuple[str, bool, str, Optional[str], bool]:
-    """execute text extraction and semantic hash calculation."""
+def phase2_frontend_worker(file_path: str, history_hash, task: dict, global_cfg: dict, log_file: str, temp_dir: str):
+    """
+    前端并行任务：计算哈希并抽取文本。
+    """
+    # 1. 计算当前文件的语义哈希
     current_hash = DeltaTracker.get_semantic_hash(file_path)
+    
+    # 2. 安全提取历史哈希（兼容字典结构和纯字符串）
     history_hash_str = history_hash.get("hash") if isinstance(history_hash, dict) else history_hash
 
+    # 3. 比对哈希，如果命中则直接跳过（无需提取文本）
     if current_hash == history_hash_str:
         return file_path, False, current_hash, None, True
 
+    # 4. 哈希未命中，开始执行增量抽取
+    import hashlib
     hash_val = hashlib.md5(file_path.encode('utf-8')).hexdigest()[:8]
+    # 使用传入的独立沙箱目录 (temp_dir) 进行无锁写入
     txt_temp_path = os.path.join(temp_dir, f"{hash_val}.txt")
 
-    python_exec = global_cfg.get('python_exec', 'python')
-    adapter_script = global_cfg.get('adapter_script', '')
+    python_exec = global_cfg.get('python_exec')
+    adapter_script = global_cfg.get('adapter_script')
     
     adapter_cmd = [
         python_exec, adapter_script,
         "-i", file_path, "-o", txt_temp_path, "-n", "1000"
     ]
     
-    success = run_subprocess(adapter_cmd, global_cfg.get('tools_dir', ''), log_file)
+    success = run_subprocess(adapter_cmd, global_cfg.get('tools_dir'), log_file)
+    
     return file_path, True, current_hash, txt_temp_path, success
 
-
 def phase2_backend_serial(file_path: str, txt_temp_path: str, task: dict, global_cfg: dict, lang: str, log_file: str) -> bool:
-    """execute tts synthesis and package the testset."""
-    python_exec = global_cfg.get('python_exec', 'python')
-    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir', '')
+    """
+    后端串行任务：使用 TTS 生成语音并打包。
+    """
+    python_exec = global_cfg.get('python_exec')
+    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir')
     test_script = global_cfg.get('test_script')
-    output_base_dir = global_cfg.get('output_dir', '')
+    output_base_dir = global_cfg.get('output_dir')
 
     if not test_script:
         test_script = os.path.join(global_cfg.get('tools_dir', 'tools'), 'make_test_set.py')
@@ -680,22 +811,23 @@ def phase2_backend_serial(file_path: str, txt_temp_path: str, task: dict, global
 
     success = run_subprocess(compiler_cmd, asrmlg_exp_dir, log_file)
 
+    # 修正错误：清理临时生成的 txt，而不是清理包含有效产物的 testset_output_dir
     if os.path.exists(txt_temp_path):
         try:
             os.remove(txt_temp_path)
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"Cleanup warning: {e.strerror}")
 
     return success
 
-
-def execute_testset_phase(tasks: List[dict], global_cfg: dict):
-    """orchestrate phase 2 execution with parallel extraction and serial tts."""
+def execute_testset_phase(tasks: list, global_cfg: dict):
+    """执行 phase 2 测试集生成 (架构：前端高并发抽取 -> 后端严格串行 tts)。"""
     print("\n=== pipeline phase 2: parallel extraction + serial tts ===")
 
-    output_base_dir = global_cfg.get('output_dir', '')
-    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir', '')
+    output_base_dir = global_cfg.get('output_dir')
+    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir')
 
+    # 为当前流水线任务创建完全隔离的专属 temp 目录
     run_uuid = uuid.uuid4().hex[:8]
     run_temp_dir = os.path.join(output_base_dir, "test_sets", f"temp_{run_uuid}")
     os.makedirs(run_temp_dir, exist_ok=True)
@@ -730,6 +862,7 @@ def execute_testset_phase(tasks: List[dict], global_cfg: dict):
                     history_hash = tracker.history.get(file_key)
                     log_file = os.path.join(log_dir, f"testset_{os.path.splitext(file_key)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
                     
+                    # 挂载专属的 run_temp_dir 到 worker
                     futures.append(executor.submit(
                         phase2_frontend_worker, file_path, history_hash, task, global_cfg, log_file, run_temp_dir
                     ))
@@ -746,7 +879,7 @@ def execute_testset_phase(tasks: List[dict], global_cfg: dict):
                     print(f"[skip] no changes: {excel_basename}")
                     continue
                     
-                if not ext_success or not txt_temp_path:
+                if not ext_success:
                     print(f"[{datetime.now().strftime('%H:%M:%S')}] failed: {excel_basename} (text extraction failed)")
                     continue
 
@@ -765,21 +898,21 @@ def execute_testset_phase(tasks: List[dict], global_cfg: dict):
             print(f"[{datetime.now().strftime('%H:%M:%S')}] task completed: manifest saved to {manifest_path}")
             
     finally:
+        # 兜底操作：强制抹除本周期的专属资源栈，保证环境清洁且互不干扰
         if os.path.exists(run_temp_dir):
             shutil.rmtree(run_temp_dir, ignore_errors=True)
             print(f"[{datetime.now().strftime('%H:%M:%S')}] cleanup: removed isolated temporary directory {run_temp_dir}")
 
-
 # =============================================================================
-# phase 3: baseline evaluation
+# Phase 3: 模型评估
 # =============================================================================
 
-def execute_eval_phase(tasks: List[dict], global_cfg: dict, executor: ProcessPoolExecutor):
-    """execute phase 3 baseline evaluation routing."""
-    print("\n=== pipeline phase 3: baseline evaluation ===")
+def execute_eval_phase(tasks: list, global_cfg: dict, executor: ProcessPoolExecutor):
+    """执行 Phase 3 模型评估 (TODO)。"""
+    print("\n=== Pipeline Phase 3: Baseline Evaluation ===")
 
-    python_exec = global_cfg.get('python_exec', 'python')
-    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir', '')
+    python_exec = global_cfg.get('python_exec')
+    asrmlg_exp_dir = global_cfg.get('asrmlg_exp_dir')
     eval_script = os.path.join(
         asrmlg_exp_dir, global_cfg.get('eval_script', 'evaluate.py')
     )
@@ -790,32 +923,33 @@ def execute_eval_phase(tasks: List[dict], global_cfg: dict, executor: ProcessPoo
             continue
 
         msg = str(task.get('msg'))
-        log_dir = os.path.join(global_cfg.get('output_dir', ''), "logs", msg)
+        log_dir = os.path.join(global_cfg.get('output_dir'), "logs", msg)
         log_file = os.path.join(log_dir, f"phase3_eval_{datetime.now().strftime('%Y%m%d')}.log")
 
         cmd = [python_exec, eval_script, "--msg", msg]
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: eval_{msg}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Eval_{msg}")
         futures[msg] = executor.submit(run_subprocess, cmd, asrmlg_exp_dir, log_file)
 
     for msg, future in futures.items():
         status = "SUCCESS" if future.result() else "FAILED"
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}: eval_{msg}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {status}: Eval_{msg}")
 
 
 # =============================================================================
-# main entry
+# 主入口 (Main Entry)
 # =============================================================================
 
 def main():
-    """main pipeline application entry point."""
-    parser = argparse.ArgumentParser(description="asr pipeline executor")
-    parser.add_argument('-g', '--global_config', required=True, help='path to global_config.yaml')
-    parser.add_argument('-j', '--job', required=True, help='path to job.yaml')
+    """主函数入口。"""
+    parser = argparse.ArgumentParser(description="ASR Pipeline Executor")
+    parser.add_argument('-g', '--global_config', required=True, help='Path to global_config.yaml')
+    parser.add_argument('-j', '--job', required=True, help='Path to job.yaml')
     args = parser.parse_args()
 
     base_path = os.path.dirname(os.path.abspath(__file__))
 
+    # 加载配置
     with open(args.global_config, 'r', encoding='utf-8') as f:
         global_cfg = yaml.safe_load(f)
     with open(args.job, 'r', encoding='utf-8') as f:
@@ -824,22 +958,33 @@ def main():
     global_cfg = resolve_and_bind_paths(global_cfg, base_path)
     tasks = job_cfg.get('tasks', [])
 
-    lang_map_path = global_cfg.get('language_map_name', '')
+    lang_map_path = global_cfg.get('language_map_name')
     global_cfg['parsed_language_map'] = load_language_map(
-        os.path.join(global_cfg.get('asrmlg_exp_dir', ''), lang_map_path)
+        os.path.join(global_cfg.get('asrmlg_exp_dir'), lang_map_path)
     )
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: phase 1 and phase 2 concurrently...")
+    # =========================================================================
+    # 宏观流水线调度 (Macro Pipeline Orchestration)
+    # =========================================================================
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] STARTING: Phase 1 and Phase 2 Concurrently...")
 
+    # 使用多线程调度器同时启动 Phase 1 和 Phase 2 
+    # (因为它们内部各自有多进程调度，所以外层用轻量级线程即可，避免创建进程池中嵌套进程池)
     with ThreadPoolExecutor(max_workers=2) as macro_executor:
         future_p1 = macro_executor.submit(execute_phase1, tasks, global_cfg)
         future_p2 = macro_executor.submit(execute_testset_phase, tasks, global_cfg)
         
+        # 强制主程序阻塞等待，直到 Phase 1 和 Phase 2 都全部彻底完成
         future_p1.result()
         future_p2.result()
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] COMPLETED: phase 1 and phase 2. moving to phase 3.")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] COMPLETED: Phase 1 and Phase 2. Moving to Phase 3.")
 
+    # =========================================================================
+    # Phase 3: 模型评估 (依赖 Phase 1 和 Phase 2 的产出)
+    # =========================================================================
+    # 在 1 和 2 完全结束后，安全地启动 Phase 3
     with ProcessPoolExecutor(max_workers=4) as executor:
         execute_eval_phase(tasks, global_cfg, executor)
 
