@@ -18,7 +18,7 @@ def load_valid_phones(syms_path: str) -> set:
 
 def merge_dictionaries(base_dict_path: str, new_dict_path: str, syms_path: str):
     valid_phones = load_valid_phones(syms_path)
-    existing_words = set()
+    existing_entries = set() # [Modify] Track exact pronunciation instead of just words
     base_lines = []
     
     # 1. Load base dictionary to memory, preserving order
@@ -29,8 +29,9 @@ def merge_dictionaries(base_dict_path: str, new_dict_path: str, syms_path: str):
                 if not line:
                     continue
                 parts = line.split('\t')
-                if len(parts) >= 1:
-                    existing_words.add(parts[0])
+                if len(parts) == 2:
+                    # Record unique word + phone combination
+                    existing_entries.add(f"{parts[0]}\t{parts[1].strip()}")
                 base_lines.append(line)
                 
     # 2. Parse and validate new dictionary
@@ -53,9 +54,10 @@ def merge_dictionaries(base_dict_path: str, new_dict_path: str, syms_path: str):
                 continue
                 
             word, phones_str = parts[0], parts[1].strip()
+            entry_key = f"{word}\t{phones_str}"
             
-            # Deduplication
-            if word in existing_words:
+            # [Modify] Deduplication based on exact pronunciation
+            if entry_key in existing_entries:
                 skip_duplicate += 1
                 continue
                 
@@ -69,8 +71,8 @@ def merge_dictionaries(base_dict_path: str, new_dict_path: str, syms_path: str):
                     continue
             
             # Append valid entry
-            base_lines.append(f"{word}\t{' '.join(phones)}")
-            existing_words.add(word)
+            base_lines.append(entry_key)
+            existing_entries.add(entry_key)
             added_count += 1
             
     # 3. Write back with strict Linux newlines (\n)
@@ -79,7 +81,8 @@ def merge_dictionaries(base_dict_path: str, new_dict_path: str, syms_path: str):
         
     print(f"Merge complete. Added: {added_count} | Duplicates: {skip_duplicate} | "
           f"Format Errors: {skip_format} | Abnormal Phones: {skip_abnormal_phone}")
-
+    
+    
 def main():
     parser = argparse.ArgumentParser(description="Strict Lexicon Merge Tool")
     parser.add_argument("-i", "--input_new", required=True, help="Path to new dictionary (G2P output)")

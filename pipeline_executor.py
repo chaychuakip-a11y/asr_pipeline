@@ -21,7 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
-
+import random
 import pandas as pd
 import yaml
 
@@ -177,6 +177,92 @@ class DeltaTracker:
 # =============================================================================
 # phase 1: resource build & g2p
 # =============================================================================
+def generate_context_for_hebrew_oov(oov_file_path: str, corpus_dir: str, g2p_input_txt: str, target_encoding: str, target_newline: str):
+    """Generate context sentences for Hebrew OOV words from Excel corpus."""
+    with open(oov_file_path, 'r', encoding='utf-8') as f:
+        oov_list = [line.strip() for line in f if line.strip()]
+
+    if not oov_list:
+        return
+
+    sent_list = []
+    shuofa_list = []
+    slot_dict = {}
+
+    # Parse Excel Corpus
+    if os.path.exists(corpus_dir):
+        for file in os.listdir(corpus_dir):
+            if not file.endswith('.xlsx') or file.startswith('~'):
+                continue
+            try:
+                xl = pd.ExcelFile(os.path.join(corpus_dir, file))
+                has_special = False
+                for sheet in xl.sheet_names:
+                    sheet_lower = sheet.lower()
+                    if 'sent' in sheet_lower:
+                        has_special = True
+                        df = pd.read_excel(xl, sheet_name=sheet, header=None)
+                        sent_list.extend([str(x).strip() for x in df.values.flatten() if pd.notna(x)])
+                    elif 'shuofa' in sheet_lower:
+                        has_special = True
+                        df = pd.read_excel(xl, sheet_name=sheet, header=None)
+                        shuofa_list.extend([str(x).strip() for x in df.values.flatten() if pd.notna(x)])
+                    elif '<>' in sheet:
+                        has_special = True
+                        df = pd.read_excel(xl, sheet_name=sheet)
+                        for col in df.columns:
+                            col_name = str(col).strip()
+                            if col_name.startswith('<') and col_name.endswith('>'):
+                                if col_name not in slot_dict:
+                                    slot_dict[col_name] = []
+                                slot_dict[col_name].extend(df[col].dropna().astype(str).str.strip().tolist())
+                if not has_special:
+                    df = pd.read_excel(xl, sheet_name=0)
+                    if 'text' in df.columns:
+                        sent_list.extend(df['text'].dropna().astype(str).str.strip().tolist())
+                    else:
+                        sent_list.extend(df.iloc[:, 0].dropna().astype(str).str.strip().tolist())
+            except Exception:
+                continue
+
+    output_lines = []
+    for oov in oov_list:
+        matched = False
+        
+        # Priority 1: Search in standard sentences (sent)
+        for sent in sent_list:
+            if oov in sent:
+                output_lines.append(sent)
+                matched = True
+                break
+        if matched: continue
+
+        # Priority 2: Search in slots and map to shuofa
+        for slot_name, slot_values in slot_dict.items():
+            if oov in slot_values:
+                valid_shuofas = [s for s in shuofa_list if slot_name in s]
+                if valid_shuofas:
+                    chosen_shuofa = random.choice(valid_shuofas)
+                    context_sent = chosen_shuofa.replace(slot_name, oov)
+                    # Fill other slots with random valid values
+                    for other_slot, other_values in slot_dict.items():
+                        if other_slot != slot_name and other_slot in context_sent and other_values:
+                            context_sent = context_sent.replace(other_slot, random.choice(other_values))
+                    # Clean up unreplaced slots
+                    context_sent = re.sub(r'<[^>]+>', '', context_sent)
+                    output_lines.append(context_sent)
+                    matched = True
+                    break
+        
+        # Fallback: Write OOV directly if no context found
+        if not matched:
+            output_lines.append(oov)
+
+    with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
+        for line in output_lines:
+            f_out.write(f"{line}{target_newline}")
+
+
 
 def build_base_command(task: dict, python_exec: str, train_script: str, asrmlg_exp_dir: str) -> List[str]:
     """build base command with dynamic parameter pass-through."""
@@ -270,10 +356,17 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
             fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: executing g2p for {msg}")
-                with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
-                    content = f_in.read()
-                with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
-                    f_out.write(content)
+                
+                # Check for Hebrew and apply context generation
+                is_hebrew = lang_abbr and lang_abbr.lower() in ['he', 'heb', 'hebrew']
+                if is_hebrew:
+                    corpus_dir = os.path.join(global_cfg.get('asrmlg_exp_dir', ''), task.get('excel_corpus_path', ''))
+                    generate_context_for_hebrew_oov(str(oov_file_path), corpus_dir, str(g2p_input_txt), target_encoding, target_newline)
+                else:
+                    with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
+                        content = f_in.read()
+                    with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
+                        f_out.write(content)
                     
                 success = run_subprocess(["bash", "run.sh"], str(g2p_lang_dir), log_file)
                 
@@ -319,9 +412,17 @@ def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> b
 
     target_res_dir = os.path.join(res_base_dir, f"{lang_name}_res", res_dir_name)
     target_dict_path = os.path.join(target_res_dir, "new_dict")
+    # [Modify] Fallback logic for phone validation files
     phone_syms_path = os.path.join(target_res_dir, "phones.syms")
-    g2p_output_dict = os.path.join(global_cfg.get('g2p_root_dir', ''), lang_abbr, "g2p_models", "output.dict")
+    if not os.path.exists(phone_syms_path):
+        fallback_path = os.path.join(target_res_dir, "phones.list.noblank")
+        if os.path.exists(fallback_path):
+            phone_syms_path = fallback_path
+        else:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n[WARNING] Neither phones.syms nor phones.list.noblank found in {target_res_dir}. Phoneme validation will be skipped.\n")
 
+    g2p_output_dict = os.path.join(global_cfg.get('g2p_root_dir', ''), lang_abbr, "g2p_models", "output.dict")
     if not os.path.exists(g2p_output_dict):
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"\n[error] g2p_output_dict missing at {g2p_output_dict}. aborting merge.\n")
@@ -352,8 +453,17 @@ def step3_merge_dict(task: dict, global_cfg: dict, msg: str, log_file: str) -> b
             "--max_versions", str(global_cfg.get('max_versions', 10))
         ], global_cfg.get('asrmlg_exp_dir'), log_file)
 
-    return True
+    # 针对 Hebrew 的特殊处理：合并完毕后将更新的 Lexicon 拷贝回 G2P 模型目录
+    is_hebrew = lang_abbr and lang_abbr.lower() in ['he', 'heb', 'hebrew']
+    if is_hebrew and merge_success:
+        import shutil
+        g2p_lang_dir = os.path.join(global_cfg.get('g2p_root_dir', ''), lang_abbr, "g2p_models")
+        if os.path.exists(g2p_lang_dir):
+            shutil.copy2(target_dict_path, g2p_lang_dir)
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n[INFO] Copied merged dictionary back to Hebrew G2P directory: {g2p_lang_dir}\n")
 
+    return True
 
 def step4_full_build(base_cmd: List[str], task_out_path: str, msg: str,
                      patch_type: str, asrmlg_exp_dir: str, log_file: str) -> bool:
