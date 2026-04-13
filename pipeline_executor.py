@@ -767,12 +767,7 @@ def phase2_frontend_worker(file_path: str, history_hash: Any, task: dict, global
     current_hash = DeltaTracker.get_semantic_hash(file_path)
     history_hash_str = history_hash.get("hash") if isinstance(history_hash, dict) else history_hash
 
-    # Check if output zip exists
-    excel_basename = os.path.splitext(os.path.basename(file_path))[0]
-    zip_path = os.path.join(output_base_dir, "test_sets", lang_name, f"{excel_basename}.zip")
-    output_exists = os.path.exists(zip_path)
-
-    if current_hash == history_hash_str and output_exists:
+    if current_hash == history_hash_str:
         return file_path, False, current_hash, None, True
 
     hash_val = current_hash[:8]
