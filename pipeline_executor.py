@@ -144,9 +144,10 @@ class DeltaTracker:
                 df = pd.read_excel(xl, sheet_name=0)
                 if 'text' in df.columns:
                     vals = df['text'].dropna().astype(str).str.strip().tolist()
+                    content_list.extend(vals)
                 else:
-                    vals = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
-                content_list.extend(vals)
+                    vals = df.values.flatten()
+                    content_list.extend([str(x).strip() for x in vals if pd.notna(x) and str(x).strip()])
 
             if not content_list:
                 raise ValueError("no valid text content found.")
@@ -357,6 +358,16 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
             try:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: executing g2p for {msg}")
                 
+                # Apply external replacement list if provided
+                replacement_path = global_cfg.get('g2p_replacement_list')
+                replacements = {}
+                if replacement_path and os.path.exists(replacement_path):
+                    with open(replacement_path, 'r', encoding='utf-8') as f_rep:
+                        for line in f_rep:
+                            parts = line.strip().split()
+                            if len(parts) >= 2:
+                                replacements[parts[0]] = " ".join(parts[1:])
+
                 # Check for Hebrew and apply context generation
                 is_hebrew = lang_abbr and lang_abbr.lower() in ['he', 'heb', 'hebrew']
                 if is_hebrew:
@@ -364,11 +375,20 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
                     generate_context_for_hebrew_oov(str(oov_file_path), corpus_dir, str(g2p_input_txt), target_encoding, target_newline)
                 else:
                     with open(oov_file_path, 'r', encoding='utf-8', errors='ignore') as f_in:
-                        content = f_in.read()
+                        lines = f_in.readlines()
                     with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
-                        f_out.write(content)
-                    
-                success = run_subprocess(["bash", "run.sh"], str(g2p_lang_dir), log_file)
+                        for line in lines:
+                            word = line.strip()
+                            if word in replacements:
+                                word = replacements[word]
+                            f_out.write(f"{word}{target_newline}")
+                
+                # Separate handling for Cloud vs Local G2P
+                cloud_langs = global_cfg.get('cloud_g2p_langs', [])
+                g2p_script = "run_cloud.sh" if lang_abbr in cloud_langs or lang_id in cloud_langs else "run.sh"
+                
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] RUNNING G2P: {g2p_script} for {msg}")
+                success = run_subprocess(["bash", g2p_script], str(g2p_lang_dir), log_file)
                 
                 if success and g2p_output_dict_shared.exists():
                     shutil.copy2(g2p_output_dict_shared, private_output_dict)
@@ -655,25 +675,26 @@ def run_phase1_pipeline(task: dict, global_cfg: dict, asrmlg_exp_dir: str,
     whisper_cfg = task.get('whisper_config', {})
     explicit_source_dir = whisper_cfg.get('source_patch_dir')
 
-    target_dir = explicit_source_dir if explicit_source_dir else os.path.join(
+    if explicit_source_dir:
+        if check_whisper_dependencies(explicit_source_dir):
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] USING EXPLICIT SOURCE: {explicit_source_dir}. skipping to whisper package.")
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n[info] using explicit source_patch_dir: {explicit_source_dir}. bypassing build steps.\n")
+                
+            if task.get('enable_whisper_package'):
+                return step5_whisper_package(task, global_cfg, explicit_source_dir, log_file)
+            return True
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] FATAL: explicit source_patch_dir missing required artifacts.")
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n[error] explicit source_patch_dir {explicit_source_dir} is invalid or incomplete.\n")
+            return False
+
+    # default target directory for new build
+    target_dir = os.path.join(
         base_out_dir, lang_name, resolved_msg,
         f"{model_type}_{datetime.now().strftime('%Y%m%d')}"
     )
-
-    if check_whisper_dependencies(target_dir):
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] FAST-FORWARD: generatedg.done and artifacts found. skipping to whisper package.")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[info] whisper dependencies met in {target_dir}. bypassing phase 1 steps 1-4.\n")
-            
-        if task.get('enable_whisper_package'):
-            return step5_whisper_package(task, global_cfg, target_dir, log_file)
-        return True
-
-    if explicit_source_dir:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] FATAL: explicit source_patch_dir missing required artifacts.")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(f"\n[error] explicit source_patch_dir {explicit_source_dir} is invalid or incomplete.\n")
-        return False
 
     base_cmd = build_base_command(task, python_exec, train_script, asrmlg_exp_dir)
 
@@ -741,15 +762,20 @@ def execute_phase1(tasks: List[dict], global_cfg: dict):
 # phase 2: incremental testset generation
 # =============================================================================
 
-def phase2_frontend_worker(file_path: str, history_hash: Any, task: dict, global_cfg: dict, log_file: str, temp_dir: str) -> Tuple[str, bool, str, Optional[str], bool]:
+def phase2_frontend_worker(file_path: str, history_hash: Any, task: dict, global_cfg: dict, log_file: str, temp_dir: str, lang_name: str, output_base_dir: str) -> Tuple[str, bool, str, Optional[str], bool]:
     """execute text extraction and semantic hash calculation."""
     current_hash = DeltaTracker.get_semantic_hash(file_path)
     history_hash_str = history_hash.get("hash") if isinstance(history_hash, dict) else history_hash
 
-    if current_hash == history_hash_str:
+    # Check if output zip exists
+    excel_basename = os.path.splitext(os.path.basename(file_path))[0]
+    zip_path = os.path.join(output_base_dir, "test_sets", lang_name, f"{excel_basename}.zip")
+    output_exists = os.path.exists(zip_path)
+
+    if current_hash == history_hash_str and output_exists:
         return file_path, False, current_hash, None, True
 
-    hash_val = hashlib.md5(file_path.encode('utf-8')).hexdigest()[:8]
+    hash_val = current_hash[:8]
     txt_temp_path = os.path.join(temp_dir, f"{hash_val}.txt")
 
     python_exec = global_cfg.get('python_exec', 'python')
@@ -841,7 +867,7 @@ def execute_testset_phase(tasks: List[dict], global_cfg: dict):
                     log_file = os.path.join(log_dir, f"testset_{os.path.splitext(file_key)[0]}_{datetime.now().strftime('%Y%m%d')}.log")
                     
                     futures.append(executor.submit(
-                        phase2_frontend_worker, file_path, history_hash, task, global_cfg, log_file, run_temp_dir
+                        phase2_frontend_worker, file_path, history_hash, task, global_cfg, log_file, run_temp_dir, lang_name, output_base_dir
                     ))
                 
                 for future in as_completed(futures):
