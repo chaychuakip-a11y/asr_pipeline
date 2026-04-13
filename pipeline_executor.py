@@ -364,9 +364,12 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
                 if replacement_path and os.path.exists(replacement_path):
                     with open(replacement_path, 'r', encoding='utf-8') as f_rep:
                         for line in f_rep:
-                            parts = line.strip().split()
-                            if len(parts) >= 2:
-                                replacements[parts[0]] = " ".join(parts[1:])
+                            line = line.strip()
+                            if not line or ':' not in line:
+                                continue
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                replacements[parts[0].strip()] = parts[1].strip()
 
                 # Check for Hebrew and apply context generation
                 is_hebrew = lang_abbr and lang_abbr.lower() in ['he', 'heb', 'hebrew']
