@@ -358,19 +358,6 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
             try:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] ACQUIRED LOCK: executing g2p for {msg}")
                 
-                # Apply external replacement list if provided
-                replacement_path = global_cfg.get('g2p_replacement_list')
-                replacements = {}
-                if replacement_path and os.path.exists(replacement_path):
-                    with open(replacement_path, 'r', encoding='utf-8') as f_rep:
-                        for line in f_rep:
-                            line = line.strip()
-                            if not line or ':' not in line:
-                                continue
-                            parts = line.split(':', 1)
-                            if len(parts) == 2:
-                                replacements[parts[0].strip()] = parts[1].strip()
-
                 # Check for Hebrew and apply context generation
                 is_hebrew = lang_abbr and lang_abbr.lower() in ['he', 'heb', 'hebrew']
                 if is_hebrew:
@@ -382,8 +369,6 @@ def step2_g2p_predict(task: dict, global_cfg: dict, msg: str, task_out_path: str
                     with open(g2p_input_txt, 'w', encoding=target_encoding, newline=target_newline) as f_out:
                         for line in lines:
                             word = line.strip()
-                            if word in replacements:
-                                word = replacements[word]
                             f_out.write(f"{word}{target_newline}")
                 
                 # Separate handling for Cloud vs Local G2P
@@ -811,6 +796,10 @@ def phase2_backend_serial(file_path: str, txt_temp_path: str, task: dict, global
     ]
     if task.get('input_wav'):
         compiler_cmd.extend(["-iw", str(task.get('input_wav'))])
+
+    replacement_path = global_cfg.get('g2p_replacement_list')
+    if replacement_path and os.path.exists(replacement_path):
+        compiler_cmd.extend(["--replacement_list", replacement_path])
 
     success = run_subprocess(compiler_cmd, asrmlg_exp_dir, log_file)
 
