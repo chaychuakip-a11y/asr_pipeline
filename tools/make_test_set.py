@@ -254,40 +254,85 @@ def main():
     if args.tts:
         filter_txt = out_dir / "filter.txt"
         oov_filter_txt = out_dir / "oov_filter.txt"
-        
+        synthesize_txt = out_dir / "synthesize.txt"
+        oov_synthesize_txt = out_dir / "oov_synthesize.txt"
+
+        # Load replacement rules BEFORE any filtering
+        # Replacements must be applied to the original text so keys can match unmodified words.
+        print(f"[DEBUG] Checking replacement list: {args.replacement_list}")
+        replacements = {}
+        if args.replacement_list and os.path.exists(args.replacement_list):
+            with open(args.replacement_list, 'r', encoding='utf-8') as f_rep:
+                for rep_line in f_rep:
+                    rep_line = rep_line.strip()
+                    if not rep_line or ':' not in rep_line:
+                        continue
+                    parts = rep_line.split(':', 1)
+                    if len(parts) == 2:
+                        replacements[parts[0].strip().upper()] = parts[1].strip()
+            print(f"[DEBUG] Loaded {len(replacements)} replacement rules (Case-Insensitive).")
+        else:
+            print(f"[DEBUG] Replacement list not found or not provided. Path: {args.replacement_list}")
+
+        # Single pass over raw input:
+        #   - filter original line  → filter.txt   (label / ground-truth)
+        #   - apply replacements to original, then filter → synthesize.txt (TTS input)
+        # Doing both in one pass guarantees 1-to-1 line correspondence before sync.
+        match_count = 0
         with open(args.txt_path, 'r', encoding='utf-8') as infile, \
-             open(filter_txt, 'w', encoding='utf-8') as outfile, \
-             open(oov_filter_txt, 'w', encoding='utf-8') as outfile_oov:
-             
+             open(filter_txt, 'w', encoding='utf-8') as f_filter, \
+             open(oov_filter_txt, 'w', encoding='utf-8') as f_filter_oov, \
+             open(synthesize_txt, 'w', encoding='utf-8') as f_synth, \
+             open(oov_synthesize_txt, 'w', encoding='utf-8') as f_synth_oov:
+
             for line in infile:
                 line = line.strip()
-                if not line: continue
-                corpus_proc_inst.filter_corpus_by_char(line, outfile, outfile_oov, args.post)
-        
-        # Handle replacement for synthesis
-        synthesize_txt = filter_txt
-        if args.replacement_list and os.path.exists(args.replacement_list):
-            replacements = {}
-            with open(args.replacement_list, 'r', encoding='utf-8') as f_rep:
-                for line in f_rep:
-                    line = line.strip()
-                    if not line or ':' not in line:
-                        continue
-                    parts = line.split(':', 1)
-                    if len(parts) == 2:
-                        replacements[parts[0].strip()] = parts[1].strip()
-            
-            if replacements:
-                synthesize_txt = out_dir / "synthesize.txt"
-                with open(filter_txt, 'r', encoding='utf-8') as f_in, \
-                     open(synthesize_txt, 'w', encoding='utf-8') as f_out:
-                    for line in f_in:
-                        line = line.strip()
-                        # Simple word replacement logic
-                        words = line.split()
-                        replaced_words = [replacements.get(w, w) for w in words]
-                        f_out.write(" ".join(replaced_words) + "\n")
-                
+                if not line:
+                    continue
+
+                # Build replacement text from the ORIGINAL (pre-filter) words
+                words = line.split()
+                new_words = []
+                for w in words:
+                    upper_w = w.upper()
+                    if upper_w in replacements:
+                        new_words.append(replacements[upper_w])
+                        match_count += 1
+                    else:
+                        new_words.append(w)
+                replaced_line = " ".join(new_words)
+
+                # Filter original → label
+                corpus_proc_inst.filter_corpus_by_char(line, f_filter, f_filter_oov, args.post)
+                # Filter replaced → TTS input
+                corpus_proc_inst.filter_corpus_by_char(replaced_line, f_synth, f_synth_oov, args.post)
+
+        print(f"[DEBUG] Applied {match_count} replacements.")
+
+        # Sync filter.txt and synthesize.txt: drop any line-pair where either side is empty.
+        # This prevents TTS from skipping blank lines and creating a wav-count mismatch.
+        with open(filter_txt, 'r', encoding='utf-8') as fa, \
+             open(synthesize_txt, 'r', encoding='utf-8') as fb:
+            filter_lines = fa.readlines()
+            synth_lines = fb.readlines()
+
+        synced_filter, synced_synth = [], []
+        for fl, sl in zip(filter_lines, synth_lines):
+            if fl.strip() and sl.strip():
+                synced_filter.append(fl if fl.endswith('\n') else fl + '\n')
+                synced_synth.append(sl if sl.endswith('\n') else sl + '\n')
+
+        dropped = len(filter_lines) - len(synced_filter)
+        if dropped:
+            print(f"[WARNING] Dropped {dropped} line(s) where filter produced empty output.")
+
+        with open(filter_txt, 'w', encoding='utf-8') as fa, \
+             open(synthesize_txt, 'w', encoding='utf-8') as fb:
+            fa.writelines(synced_filter)
+            fb.writelines(synced_synth)
+
+        print(f"[DEBUG] Synthesis text prepared: {synthesize_txt.resolve()} ({len(synced_synth)} lines)")
+
         output_path, gen_wav_dir = run_tts_generation(str(synthesize_txt), args.language, args.output, label_txt=str(filter_txt))
         build_testset_package(output_path, args.language, gen_wav_dir, args.output, args.post, corpus_proc_inst)
         
